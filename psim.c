@@ -6,18 +6,18 @@
 #include <sys/resource.h>
 #include <time.h>
 
-const char control_fname[] = "/home/jtmcg/psim/render_color.txt";
+const char control_fname[] = "/home/jtmcg/projects/psim/render_color.txt";
 
 // Window geometry
-#define WIDTH 5000.0
+#define WIDTH 5500.0
 #define RENDER_WIDTH 3680.0
 #define HEIGHT 1000.0
 #define WALL_RADIUS 4500.0
 #define NECK_HEIGHT 250.0
 
 // Simulation parameters
-#define NUM_PARTICLES 4000 //number of particles in the simulation
-#define RADIUS 4.5 //radius of each particle
+#define NUM_PARTICLES 4500 //number of particles in the simulation
+#define RADIUS 5.5 //radius of each particle
 #define PPS 400 // Target average speed in channel in pixels per second for viewing
 #define DT 1.0 // initial timestep for simulation
 #define REPOS 1.0001 // Repositioning constant. Puts particles slightly further away on bounce to prevent them getting stuck
@@ -32,7 +32,7 @@ const char control_fname[] = "/home/jtmcg/psim/render_color.txt";
 
 // Surface roughness, scales the random shifts applied to wall bounce angle
 //     Effectively generates entropy
-#define ROUGHNESS_ANG 0.0*M_PI/180.0
+#define ROUGHNESS_ANG 0.0
 
 // Number of distinct sections for pressure and speed computations
 #define SECTIONS 18
@@ -46,7 +46,7 @@ const char control_fname[] = "/home/jtmcg/psim/render_color.txt";
 //#define INIT_HALF
 
 // Define this to draw walls. Takes a while on startup to compute the draw circle
-#define DRAW_WALLS
+//#define DRAW_WALLS
 const int wall_color[3] = {128, 128, 140};
 
 
@@ -128,13 +128,13 @@ void householder(particle *p, float nx, float ny, float bleed){
 
 static float bounce_accum[SECTIONS];
 static float speeds[SECTIONS];
-static float last_speeds[SECTIONS];
+static float x_spds[SECTIONS];
 static float pressure[SECTIONS];
 static float pressure_igl[SECTIONS];
 static float density[SECTIONS];
 static float temp[SECTIONS];
 static float temperature[SECTIONS];
-static float spd_cnt[SECTIONS];
+static int spd_cnt[SECTIONS];
 static float p_areas[SECTIONS];
 static float d_areas[SECTIONS];
 static double speed_sum = 0;
@@ -190,6 +190,119 @@ static float init_avg_speed = 0;
 static float avg_speed = 0;
 static float bpwr = BLOW_POWER, bpwr_command = BLOW_POWER;
 
+inline uint8_t top_bot_bounce(particle *p, float energy_bleed, const float wall_offset){
+    float py = p->y;
+    // Check Y rectangle bounds
+    if(py <= (wall_offset + RADIUS)){
+        householder(p, 0, -1, energy_bleed);
+        p->y = RADIUS*REPOS + wall_offset;
+        return 1;
+    }
+    if(py >= (HEIGHT-RADIUS-wall_offset)){
+        householder(p, 0, 1, energy_bleed);
+        p->y = HEIGHT - RADIUS*REPOS - wall_offset;
+        return 1;
+    }
+    return 0;
+}
+
+inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_close, const float throat_width, const float length, const float throat_x){
+    // Distance from wall to throat opening
+    const float b = (HEIGHT-throat_width)/2;
+    const float m = b / length;
+    const float m2 = m*m;
+    const float nx = sqrtf(m2 / (1+m2));
+    const float ny = sqrtf(1.0 / (1+m2));
+    if(open_close){
+        // Return no change if outside of x bounds
+        //if((p->x < (throat_x-length)) || (p->x >= throat_x))  return 0;
+        // Compute slope and y intercept of bounding lines
+        const float b_up = m*(length-throat_x) + RADIUS;
+        float yc = m*(p->x) + b_up;
+        // Check upper boundary
+        if(p->y < yc){
+            householder(p, -nx, ny, energy_bleed);
+            p->y = yc+(REPOS-1.0);
+            return 1;
+        }
+        // Repeat for lower boundary
+        const float b_dwn = (-m)*(length-throat_x) + HEIGHT - RADIUS;
+        yc = (-m)*(p->x) + b_dwn;
+        if(p->y > yc){
+            householder(p, -nx, -ny, energy_bleed);
+            p->y = yc-(REPOS-1.0);
+            return 1;
+        }
+    }else{
+        // Return no change if outside of x bounds
+        //if((p->x < throat_x) || (p->x >= (throat_x+length)))  return 0;
+        // Compute slope and y intercept of bounding lines
+        const float b_up = m*throat_x + RADIUS + b;
+        float yc = (-m)*(p->x) + b_up;
+        // Check upper boundary
+        if(p->y < yc){
+            householder(p, nx, ny, energy_bleed);
+            p->y = yc+(REPOS-1.0);
+            return 1;
+        }
+        // Repeat for lower boundary
+        const float b_dwn = (-m)*throat_x + b + throat_width - RADIUS;
+        yc = m*(p->x) + b_dwn;
+        if(p->y > yc){
+            householder(p, nx, -ny, energy_bleed);
+            p->y = yc-(REPOS-1.0);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+inline int get_section(particle *p){
+    float s = floorf((p->x - UNREND)/(RENDER_WIDTH/SECTIONS));
+    int si = (int)s;
+    if(si>(SECTIONS-1))  si = -1;
+    return si;
+}
+
+#define THROAT_WIDTH (HEIGHT*0.3)
+uint8_t venturi_bounce2(particle *p, float energy_bleed){
+    // Implement left boundary wrap with magic force optional
+    if(p->x <= 0){
+        p->x = (WIDTH-REPOS+1);
+        #ifndef MAGIC_FORCE
+            p->vx -= bpwr_command;
+        #endif
+    // Implement right boundary crossing
+    }else if(p->x >= WIDTH)  p->x = (REPOS-1);
+    
+    int s = get_section(p);
+    float vx = p->vx, vy = p->vy;
+    speed_sum += vx;
+    speed_cnt++;
+
+    if(s > -1){
+        x_spds[s] += vx;
+        temperature[s] += (vx*vx + vy*vy);
+        spd_cnt[s] ++;
+    }
+    // Compute the X offset
+    const float x_offset = (WIDTH - RENDER_WIDTH)*0.5;
+    float x = p->x - x_offset;
+    // Wide wall bounce
+    if( x < RENDER_WIDTH*0.15 ){
+        return top_bot_bounce(p, energy_bleed, 0.0);
+    // Divergent section
+    }else if( x < RENDER_WIDTH*0.5 ){
+        return constriction(p, energy_bleed, 1, THROAT_WIDTH, RENDER_WIDTH*(0.5-0.15), RENDER_WIDTH*0.5+x_offset);
+    }else if( x < RENDER_WIDTH*0.65 ){
+        return top_bot_bounce(p, energy_bleed, (HEIGHT-THROAT_WIDTH)*0.5);
+    }else if( x < RENDER_WIDTH*0.85 ){
+        return constriction(p, energy_bleed, 0, THROAT_WIDTH, RENDER_WIDTH*(0.85-0.65), RENDER_WIDTH*0.65+x_offset);
+    }else{
+        return top_bot_bounce(p, energy_bleed, 0.0);
+    }
+}
+
 uint8_t venturi_bounce(particle *p, float energy_bleed){
     float px = p->x;
     // Check X rectangle bounds
@@ -214,10 +327,9 @@ uint8_t venturi_bounce(particle *p, float energy_bleed){
     speed_cnt++;
 
     if(pvalid){
-        speeds[pind] += vx;
-        vx -= last_speeds[pind];
+        x_spds[pind] += vx;
         temperature[pind] += (vx*vx + vy*vy);
-        spd_cnt[pind] += 1.0;
+        spd_cnt[pind]++;
     }
 
     float s, nx, ny;
@@ -303,7 +415,7 @@ inline uint8_t check_overlap(particle* particles, float x, float y, int occ){
     #ifdef INIT_HALF
     if(x<WIDTH*0.65 || x>WIDTH*0.9){ return 1; }
     #endif
-    if(venturi_bounce(&p, 1.0)){ return 1; }
+    if(venturi_bounce2(&p, 1.0)){ return 1; }
     for(int i=0; i<occ; i++){
         float dx = particles[i].x - x;
         float dy = particles[i].y - y;
@@ -424,7 +536,7 @@ float simulate_timestep(particle* particles, float ideal_dist) {
 
     // Check for collisions with bounding box
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        venturi_bounce(particles+i, slowdown);
+        venturi_bounce2(particles+i, slowdown);
     }
 
     // Return the current amount of slowdown to maintain energy
@@ -971,6 +1083,8 @@ int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
     SDL_Window* window = SDL_CreateWindow("Particle Simulation", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, RENDER_WIDTH, HEIGHT, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if(renderer == NULL){ printf("ERR: Failure to create renderer.\n\n"); exit(EXIT_FAILURE); }
+    //SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 
     //initialize particles
     particle particles[NUM_PARTICLES];
@@ -1129,12 +1243,9 @@ int main(int argc, char* argv[]) {
             // Adjust each section by scaling factors
             for(int i=0; i<SECTIONS; i++){
                 // X speed given per particle
-                speeds[i] = speeds[i]/spd_cnt[i];
-                last_speeds[i] = speeds[i];
+                speeds[i] = x_spds[i]/spd_cnt[i];
                 // Avg KE given per particle
                 temperature[i] = temperature[i]/spd_cnt[i];
-                // Bounce accumulation given per unit wall area
-                bounce_accum[i] = bounce_accum[i]/(p_areas[i]);
                 // Densities given per unit neck area
                 spd_cnt[i] = spd_cnt[i]/d_areas[i];
                 // Ideal gas law pressure is temp * density
