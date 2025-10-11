@@ -9,7 +9,7 @@ from tkinter import *
 
 warnings.simplefilter('ignore')
 
-subprocess.run(["gcc", "psim.c", "-O3", "-o", "particle_sim", "-I", "/usr/include", "-lm", "-lSDL2"])
+subprocess.run(["gcc", "psim.c", "-O3", "-o", "particle_sim", "-I", "/usr/include", "-lm", "-lSDL2", "-lSDL2_ttf"])
 time.sleep(0.5)
 
 sim = subprocess.Popen(["./particle_sim"], stdout=subprocess.PIPE)
@@ -24,9 +24,6 @@ def to_int(line):
 
 first_rx = False
 last_rx = False
-
-fig2, axx = plt.subplots()
-fig2.suptitle("Relative Pressures")
 
 figm, axm = plt.subplots()
 axmach = axm.twinx()
@@ -47,21 +44,17 @@ while True:
 
     if(line[:5] == "SPEED"):
         speed = to_int(line)
-        axx.cla()
         axm.cla()
         axmach.cla()
         first_rx = True
-        axx.plot(speed, label="X Speed")
     elif(line[:5] == "PRESS"):
         pressure = to_int(line)
-        axx.plot(pressure, label="Pressure")
     elif(line[:5] == "TEMPS"):
         temps = to_int(line)
     elif(line[:5] == "DENSI"):
         density = to_int(line)
     elif(line[:5] == "IGLP:"):
         iglp = to_int(line)
-        axx.plot(iglp, label="Pressure (IGL)")
     elif(line[:5] == "AREA:"):
         area = to_int(line)
     elif(line[:5] == "MACH:"):
@@ -108,15 +101,12 @@ while True:
         axmach.yaxis.set_label_position("right")
         axmach.tick_params(labelbottom=False)
         axm.plot(np.array(speed), label="X Speed")
-        axm.plot(np.array(area), label="Channel Area")
         axm.plot(np.array(density), label="Density")
+        axm.plot(np.array(pressure), label="Pressure")
         axm.plot(np.array(temps), label="Temperature")
-        axm.set_ylim([0, max([max(speed), max(area), max(density), max(temps)])*1.1])
+        axm.set_ylim([0, max([max(speed), max(pressure), max(density), max(temps)])*1.1])
         axm.legend()
         axm.tick_params(labelleft=False, labelbottom=False)
-        axx.set_ylim([0, max([max(pressure), max(speed)])*1.1])
-        axx.legend()
-        axx.tick_params(labelleft=False, labelbottom=False)
         
 
 plt.show()

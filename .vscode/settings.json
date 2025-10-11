@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "sdl_test_font.h": "c",
+        "sdl.h": "c",
+        "time.h": "c",
+        "sdl_ttf.h": "c"
+    }
+}

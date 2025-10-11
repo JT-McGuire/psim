@@ -50,7 +50,6 @@ const int wall_color[3] = {255, 0, 0};
 #define ROOT2O2 0.7071067811865476
 
 
-
 //structure for a single particle
 typedef struct {
     float x; //x position of particle
@@ -81,17 +80,6 @@ char get_render_color(){
     return (char)char0;
 }
 
-// Function to randomize the input bounce angle according to the roughness angle
-inline void rand_bounce(float *nx, float *ny){
-    float rang = (randf()-0.5)*2*ROUGHNESS_ANG;
-    float c = cosf(rang);
-    float s = sinf(rang);
-    float ox = *nx;
-    float oy = *ny;
-    *nx = ox*c - oy*s;
-    *ny = ox*s + oy*c;
-}
-
 // Householder reflection function for particle velocities
 inline void householder(particle *p, float nx, float ny){
     float s = 2*(nx*p->vx + ny*p->vy);
@@ -100,75 +88,9 @@ inline void householder(particle *p, float nx, float ny){
 }
 
 // Geometry definitions for walls
-#define BIGCIRC_X (WIDTH/2)
 #define UNREND ((WIDTH-RENDER_WIDTH)/2.0)
-#define BIGCIRC_YH (HEIGHT/2+NECK_HEIGHT/2+WALL_RADIUS)
-#define BIGCIRC_YL (HEIGHT/2-NECK_HEIGHT/2-WALL_RADIUS)
-#define PUSH_RAD ((WALL_RADIUS+RADIUS)*REPOS)
 
-// Measurement arrays
-static float bounce_accum[SECTIONS];
-static float speeds[SECTIONS];
-static float last_speeds[SECTIONS];
-static float pressure[SECTIONS];
-static float density[SECTIONS];
-static float temp[SECTIONS];
-static float temperature[SECTIONS];
-static float spd_cnt[SECTIONS];
-static float p_areas[SECTIONS];
-static float d_areas[SECTIONS];
-
-static float mean_fpl;
 static float circle_intersect;
-
-// Function to fill the "areas" for relative pressure and density computations
-#define BIGCIRC_XR (BIGCIRC_X-UNREND)
-void get_areas(){
-    float lb, rb, cx, cy, ar, nar;
-    circle_intersect = sqrt(WALL_RADIUS*WALL_RADIUS - BIGCIRC_YL*BIGCIRC_YL);
-    float theta0 = asinf(circle_intersect/WALL_RADIUS);
-    float theta1 = asinf(-BIGCIRC_YL/WALL_RADIUS);
-    float lc_bound = BIGCIRC_XR - circle_intersect;
-    float rc_bound = BIGCIRC_XR + circle_intersect;
-    // Iterate through the sections
-    for(int i=0; i<SECTIONS; i++){
-        // Get left/right x bounds
-        lb = (RENDER_WIDTH/SECTIONS)*i;
-        rb = lb + (RENDER_WIDTH/SECTIONS);
-        // Left of the big circle
-        if(lb<lc_bound && rb<=lc_bound){
-            ar = rb-lb;
-            nar = HEIGHT;
-        // Bounds contain the left edge of the big circle
-        }else if(rb>lc_bound && lb<lc_bound){
-            float theta = asinf((BIGCIRC_XR-rb)/WALL_RADIUS);
-            // Length along wall plus arc length of included circle section
-            ar = (lc_bound-lb) + WALL_RADIUS*(theta0 - theta);
-            // This is the trapezoidal approximation for average area
-            nar = (HEIGHT + HEIGHT - 2*(BIGCIRC_YL+WALL_RADIUS*cosf(theta)))/2;
-        // Bounds within big circle
-        }else if(lb>=lc_bound && rb<=rc_bound){
-            float thetaA = asinf((BIGCIRC_XR-lb)/WALL_RADIUS);
-            float thetaB = asinf((BIGCIRC_XR-rb)/WALL_RADIUS);
-            ar = WALL_RADIUS * (thetaA - thetaB);
-            nar = (HEIGHT-2*(BIGCIRC_YL+WALL_RADIUS*cosf(thetaA)) + HEIGHT-2*(BIGCIRC_YL+WALL_RADIUS*cosf(thetaB)))/2;
-        // Bounds contain the right edge of the big circle
-        }else if(lb<rc_bound && rb>rc_bound){
-            float theta = asinf((BIGCIRC_XR-lb)/WALL_RADIUS);
-            ar = WALL_RADIUS*(theta + theta0) + (rb-rc_bound);
-            nar = (HEIGHT + HEIGHT - 2*(BIGCIRC_YL+WALL_RADIUS*cosf(theta)))/2;
-        // Otherwise assume right of big circle
-        }else{
-            ar = rb-lb;
-            nar = HEIGHT;
-        }
-        // Save the pressure areas
-        p_areas[i] = 2*ar;
-        // Save the average channel heights used for density computation
-        d_areas[i] = nar;
-        printf("SECTION %d: WALL AREA %.1f, NECK AREA %.1f\n", i, 2*ar, nar);
-    }
-}
 
 static float feed_rate = 0;
 static float bleed_rate = 0;
@@ -176,146 +98,45 @@ static double upstream_psum = 0;
 static double downstream_psum = 0;
 static int chance_cnt = 0;
 
-// Function to execute bounces for particles striking channel walls
-uint8_t venturi_bounce(particle *p, int i){
-    // Gather information for statistics
-    float px = p->x;
-    int pind = (int)((px - UNREND)/(RENDER_WIDTH/SECTIONS));
-    uint8_t pvalid = (px < RENDER_WIDTH+UNREND) && (px >= UNREND);
+
+
+#define THROAT_WIDTH (HEIGHT*0.3)
+uint8_t venturi_bounce(particle *p, float energy_bleed){
+    // Implement left boundary wrap with magic force optional
+    if(p->x <= 0){
+        p->x = (WIDTH-REPOS+1);
+        #ifndef MAGIC_FORCE
+            p->vx -= bpwr_command;
+        #endif
+    // Implement right boundary crossing
+    }else if(p->x >= WIDTH)  p->x = (REPOS-1);
+    
+    int s = get_section(p);
     float vx = p->vx, vy = p->vy;
-    if(pvalid){
-        speeds[pind] += vx;
-        vx -= last_speeds[pind];
-        temperature[pind] += (vx*vx + vy*vy)/8.0;
-        spd_cnt[pind] += 1.0;
-    }
+    speed_sum += vx;
+    speed_cnt++;
 
-    float s, nx, ny;
-    uint8_t bounds_exceed = 0;
-
-    // Left edge bounce/dissapear behavior
-    if(px <= RADIUS){
-        bounds_exceed = 1;
-        chance_cnt++;
-        // Randomly determine if this particle will be released
-        if(randf() < bleed_rate){
-            // Was released
-            // Add index to reserve list and nullify the particle params
-            if(reserve_count<NUM_PARTICLES){
-                reserve_inds[reserve_count] = i;
-                reserve_count++;
-            }else{
-                fprintf(stderr, "Last particle was bled. Something is very wrong...\n\n");
-                exit(1);
-            }
-            p->x = -1;
-            p->y = -1;
-            p->vx = 0;
-            p->vy = 0;
-        // Otherwise normal bounce
-        }else{
-            downstream_psum = (p->vx < 0) ? (downstream_psum - p->vx) : (downstream_psum + p->vx);
-            nx=-1;
-            ny=0;
-            rand_bounce(&nx, &ny);
-            householder(p, nx, ny);
-            p->x = RADIUS*REPOS;
-        }
+    if(s > -1){
+        x_spds[s] += vx;
+        temperature[s] += (vx*vx + vy*vy);
+        spd_cnt[s] ++;
     }
-    // Right edge bounce behavior
-    else if(px >= (WIDTH-RADIUS)){
-        bounds_exceed = 1;
-        upstream_psum = (p->vx < 0) ? (upstream_psum - p->vx) : (upstream_psum + p->vx);
-        nx=1;
-        ny=0;
-        rand_bounce(&nx, &ny);
-        householder(p, nx, ny);
-        p->x = WIDTH-RADIUS*REPOS;
+    // Compute the X offset
+    const float x_offset = (WIDTH - RENDER_WIDTH)*0.5;
+    float x = p->x - x_offset;
+    // Wide wall bounce
+    if( x < RENDER_WIDTH*0.15 ){
+        return top_bot_bounce(p, energy_bleed, 0.0);
+    // Divergent section
+    }else if( x < RENDER_WIDTH*0.5 ){
+        return constriction(p, energy_bleed, 1, THROAT_WIDTH, RENDER_WIDTH*(0.5-0.15), RENDER_WIDTH*0.5+x_offset);
+    }else if( x < RENDER_WIDTH*0.65 ){
+        return top_bot_bounce(p, energy_bleed, (HEIGHT-THROAT_WIDTH)*0.5);
+    }else if( x < RENDER_WIDTH*0.85 ){
+        return constriction(p, energy_bleed, 0, THROAT_WIDTH, RENDER_WIDTH*(0.85-0.65), RENDER_WIDTH*0.65+x_offset);
+    }else{
+        return top_bot_bounce(p, energy_bleed, 0.0);
     }
-
-    float py = p->y;
-    // Check Y rectangle bounds
-    if(py <= RADIUS){
-        bounds_exceed = 1;
-        float ay = p->vy;
-        float ax = p->vx;
-        // Increment the correct bounce accumulator for pressure graph
-        if(pvalid){
-            bounce_accum[pind] -= ay;
-        }
-        // Increment the upstream/downstream pressure accumulators if x in range
-        // float px = p->x;
-        // if(px<(BIGCIRC_X-circle_intersect)){
-        //     downstream_psum = (ay < 0) ? (downstream_psum - ay) : (downstream_psum + ay);
-        // }else if(px>(BIGCIRC_X+circle_intersect)){
-        //     upstream_psum = (ay < 0) ? (upstream_psum - ay) : (upstream_psum + ay);
-        // }
-        nx=0;
-        ny=-1;
-        rand_bounce(&nx, &ny);
-        householder(p, nx, ny);
-        p->y = RADIUS*REPOS;
-    }
-    else if(py >= (HEIGHT-RADIUS)){
-        bounds_exceed = 1;
-        float ay = p->vy;
-        float ax = p->vx;
-        if(pvalid){
-            bounce_accum[pind] += ay;
-        }
-        // Increment the upstream/downstream pressure accumulators if x in range
-        // float px = p->x;
-        // if(px<(BIGCIRC_X-circle_intersect)){
-        //     downstream_psum = (ay < 0) ? (downstream_psum - ay) : (downstream_psum + ay);
-        // }else if(px>(BIGCIRC_X+circle_intersect)){
-        //     upstream_psum = (ay < 0) ? (upstream_psum - ay) : (upstream_psum + ay);
-        // }
-        nx=0;
-        ny=1;
-        rand_bounce(&nx, &ny);
-        householder(p, nx, ny);
-        p->y = HEIGHT-RADIUS*REPOS;
-    }
-
-    // Compute distance from upper part of constriction bound
-    float dx = p->x - BIGCIRC_X;
-    float dy = p->y - BIGCIRC_YH;
-    float dx2 = dx*dx;
-    float dist = sqrt(dx2 + dy*dy);
-    float mom;
-    if( dist<(WALL_RADIUS+RADIUS) ){
-        // Perform householder reflection of velocity
-        nx = dx/dist;
-        ny = dy/dist;
-        mom = nx*p->vx + ny*p->vy; // Scalar projection of the particle velocity onto the normal vector
-        if(mom<0){ mom=0-mom; }
-        bounce_accum[pind] += mom;
-        p->x = BIGCIRC_X + PUSH_RAD*nx;
-        p->y = BIGCIRC_YH + PUSH_RAD*ny;
-        rand_bounce(&nx, &ny);
-        householder(p, nx, ny);
-        //householder(p, nx, ny, 1.0);
-        return 1;
-    }
-
-    dy = p->y - BIGCIRC_YL;
-    dist = sqrt(dx2 + dy*dy);
-    if( dist<(WALL_RADIUS+RADIUS) ){
-        // Perform householder reflection of velocity
-        nx = dx/dist;
-        ny = dy/dist;
-        mom = nx*p->vx + ny*p->vy;
-        if(mom<0){ mom=0-mom; }
-        bounce_accum[pind] += mom;
-        p->x = BIGCIRC_X + PUSH_RAD*nx;
-        p->y = BIGCIRC_YL + PUSH_RAD*ny;
-        rand_bounce(&nx, &ny);
-        householder(p, nx, ny);
-        //householder(p, nx, ny, 1.0);
-        return 1;
-    }
-
-    return bounds_exceed;
 }
 
 // Function to check if particles overlap with themselves or bounds
