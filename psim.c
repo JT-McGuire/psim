@@ -7,32 +7,31 @@
 #include <sys/resource.h>
 #include <time.h>
 
-const char control_fname[] = "/home/jtmcg/projects/psim/render_color.txt";
+const char control_fname[] = "/home/jtmcg/projects/psim/ctrl.txt";
 
 // Window geometry
-#define WIDTH 5000.0
+#define WIDTH 4500.0
 #define RENDER_WIDTH 3680.0
 #define HEIGHT 1100.0
 #define UNREND ((WIDTH-RENDER_WIDTH)/2)
 #define TXT_HEIGHT 45
 // Channel geometry
-#define THROAT_WIDTH (HEIGHT*0.4)
-#define CONVERGE_START 0.92
+#define THROAT_WIDTH (HEIGHT*0.45)
+#define CONVERGE_START 0.9
 #define THROAT_POS 0.6
-#define DIVERGE_START 0.5
+#define DIVERGE_START 0.55
 #define DIVERGE_END 0.08
 
 // Simulation parameters
-#define NUM_PARTICLES 2500 //number of particles in the simulation
+#define NUM_PARTICLES 3000 //number of particles in the simulation
 #define RADIUS 6 //radius of each particle
-#define INIT_DT 2.5 // initial timestep for simulation
+#define INIT_DT 0.18 // initial timestep for simulation
 #define REPOS 1.0001 // Repositioning constant. Puts particles slightly further away on bounce to prevent them getting stuck
 
 // Blower power, expressed as a fraction of initial temperature
-#define BLOW_POWER 0.8
-#define MDOT_TARG 0.11 // Good for subsonic
-//#define MDOT_TARG 0.5 // Good for supersonic
-#define SMOOTHY 0.07
+#define MDOT_TARG 0.1 // Good for subsonic
+//#define MDOT_TARG 0.65 // Good for supersonic
+#define SMOOTHY 0.1
 
 // Surface roughness, scales the random shifts applied to wall bounce angle
 //     Effectively generates entropy
@@ -56,43 +55,57 @@ typedef struct {
 // Returns a random float between 0 and 1
 inline float randf(){ return ((float)rand() / RAND_MAX); }
 
-static float dt = INIT_DT;
-
 // Function to read information from control file
-char get_render_color(){
+char get_file_info(float *sim_spd, float *mdot){
     FILE* fp = fopen(control_fname, "r");
     if( fp == NULL )  return 0;
-
-    int char0 = fgetc(fp);
-    char charr = 0;
-    // Capture and return last alphabet char in file
-    while (char0!=EOF && char0!='\n'){
-        if(char0>=65 && char0<=90)  charr = char0;
-        else if(char0>=97 && char0<=122)  charr = char0;
-        char0 = fgetc(fp);
+    // Pull first line
+    char rs[40];
+    if(fgets(rs, 40, fp)==NULL)  return 0;
+    // Capture the last alpha char value in the string and replace all with white space
+    char charr = '\0';
+    for(int i=0; i<40; i++){
+        char c = rs[i];
+        if(c==0)  break;
+        else if(c>=65 && c<=90){  charr = c;  rs[i]=' ';  }
+        else if(c>=97 && c<=122){  charr = c;  rs[i]=' ';  }
     }
+    // Assign value if valid float found in first line
+    float ret = atof(rs);
+    if(ret!=0.0) *sim_spd = ret;
+    // Pull the second line and assign if valid
+    if(fgets(rs, 40, fp)==NULL)  return charr;
+    ret = atof(rs);
+    if(ret!=0.0) *mdot = ret;
 
     fclose(fp);
     return charr;
-}
-
-// Function to randomize the input bounce angle according to the roughness angle
-void rand_bounce(float *nx, float *ny){
-    float rang = (randf()-0.5)*2*ROUGHNESS_ANG;
-    float c = cosf(rang);
-    float s = sinf(rang);
-    float ox = *nx;
-    float oy = *ny;
-    *nx = ox*c - oy*s;
-    *ny = ox*s + oy*c;
 }
 
 // Function to determine which section the particle is in. Negative value is out of bounds
 inline int get_section(particle *p){
     float s = floorf((p->x - UNREND)/(RENDER_WIDTH/SECTIONS));
     int si = (int)s;
-    if(si>(SECTIONS-1))  si = -1;
+    if(si>(SECTIONS-1))  return -1;
     return si;
+}
+
+static float reflect_rms = 0.0;
+void inline lambert_reflect(particle *p, float surf_nx, float surf_ny, float bleed){
+    // Generate random lambertian normal vector
+    float rf = randf();
+    float r1r = rf*(1.0-rf);
+    float nx = 2.0*sqrtf(r1r)*(2.0*rf-1.0);
+    float ny = 4.0*r1r;
+    // Rotate lambertian random normal to surface alignement
+    float nx_rot = surf_ny*nx - surf_nx*ny;
+    float ny_rot = surf_nx*nx + surf_ny*ny;
+    // Keep a running average RMS impact velocity
+    float vx = p->vx, vy=p->vy;
+    reflect_rms = 0.9*reflect_rms + 0.1*sqrtf(vx*vx + vy*vy);
+    // Diffuse reflect the particle
+    p->vx = bleed*nx_rot*reflect_rms;
+    p->vy = bleed*ny_rot*reflect_rms;
 }
 
 // Householder reflection function for particle velocities
@@ -103,6 +116,10 @@ inline void householder(particle *p, float nx, float ny, float bleed){
     // Compute section summations for wall impact momentum
     int sect = get_section(p);
     if(sect >= 0)  momentum_sums[sect] += fabsf(dot);
+    // if(randf()>0.7){
+    //     lambert_reflect(p, nx, ny, bleed);
+    //     return;
+    // }
     // Set bounce velocity
     float s = (1.0+bleed)*dot;
     p->vx -= nx*s;
@@ -182,14 +199,17 @@ static float vx_sums[SECTIONS] = {0};
 static float vx_means[SECTIONS] = {0};
 static float e_sums[SECTIONS] = {0};
 static uint32_t pcnts[SECTIONS] = {0};
+static float section_areas[SECTIONS] = {0};
 static int mass_flow_sum = 0;
 static uint32_t mass_flow_cnt = 0;
 
-static float blow_pwr = BLOW_POWER;
+static float blow_pwr = 0;
 uint8_t venturi_bounce(particle *p, float energy_bleed){
     // Implement left boundary wrap
     if(p->x <= 0){
         p->x = (WIDTH-REPOS+1);
+        p->vx *= energy_bleed;
+        p->vy *= energy_bleed;
         // Add fan speed to particle
         p->vx -= blow_pwr;
         // Increment the mass flow rate counter
@@ -217,7 +237,7 @@ uint8_t venturi_bounce(particle *p, float energy_bleed){
     }
     // Compute the X offset
     float x = p->x - UNREND;
-    //energy_bleed = 1.0;
+    energy_bleed = 1.0;
     // Wide wall bounce
     if( x < RENDER_WIDTH*DIVERGE_END ){
         return top_bot_bounce(p, energy_bleed, 0.0);
@@ -252,8 +272,18 @@ inline uint8_t check_overlap(particle* particles, float x, float y, int occ){
     return 0;
 }
 
+static float mdot_targ = MDOT_TARG;
+static float dt = INIT_DT;
 // Function to initialize particles with random positions and velocities
-void init_particles(particle* particles) {
+void init_particles(particle* particles, float *areas) {
+    // Get total area in square pixels
+    double ar_tot = HEIGHT*(WIDTH-RENDER_WIDTH);
+    for(int i=0; i<SECTIONS; i++)  ar_tot += areas[i]*(RENDER_WIDTH*HEIGHT/SECTIONS);
+    // Get particle density
+    float density = (float)NUM_PARTICLES / ar_tot;
+    // Predict speed required to hit given mass flow rate
+    float init_spd = MDOT_TARG / (HEIGHT * density);
+    printf("INIT PARTICLE SPD: %.3f\n\n", init_spd);
     int i=0;
     // Continue to generate new particles at random locations until desired quantity is reached
     while(i<NUM_PARTICLES){
@@ -263,29 +293,16 @@ void init_particles(particle* particles) {
             particles[i].x = cx;
             particles[i].y = cy;
             particles[i].vy = (randf()*2 - 1);
-            particles[i].vx = (randf() - 0.5) - 2*MDOT_TARG;
+            particles[i].vx = (randf() - 0.5) - 3*init_spd;
             i++;
         }
     }
 }
 
 // Declare and zero the initial energy
-static double initial_energy=0.0;
-static float slowdown = 0;
 static float last_dist[NUM_PARTICLES*NUM_PARTICLES/2];
 
-// Function to simulate a timestep for each particle
-float simulate_timestep(particle* particles) {
-    float spd2;
-    // Compute the initial energy if it is the first go around
-    if(initial_energy==0.0){
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            spd2 = particles[i].vx*particles[i].vx + particles[i].vy*particles[i].vy;
-            initial_energy += spd2;
-        }
-        slowdown = 1.0;
-    }
-
+inline void interparticle_bounce(particle *particles){
     // Scan through all particle pair combos
     for (int i = 0; i < (NUM_PARTICLES - 1); i++) {
         float ix = particles[i].x;
@@ -327,29 +344,43 @@ float simulate_timestep(particle* particles) {
             }
         }
     }
+}
 
+double inline get_energy(particle *particles){
+    double en = 0;
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        float spd2 = particles[i].vx*particles[i].vx + particles[i].vy*particles[i].vy;
+        en += spd2;
+    }
+    return en;
+}
+
+static float slowdown = 0;
+static double initial_energy=0.0;
+// Function to simulate a timestep for each particle
+float simulate_timestep(particle* particles, double elapsed_time_ms) {
+    // Compute the initial energy if it is the first go around
+    if(initial_energy==0.0){
+        initial_energy = get_energy(particles);
+        slowdown = 1.0;
+    }
+    // Check all particle pairs for collision events
+    interparticle_bounce(particles);
     double current_energy = 0;    
     // Update positions of particles
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        float x = particles[i].x;
-        float y = particles[i].y;
         float vx = particles[i].vx;
         float vy = particles[i].vy;
-        x += vx * dt;
-        y += vy * dt;
-        particles[i].x = x;
-        particles[i].y = y;
-        spd2 = vx*vx + vy*vy;
+        particles[i].x += (vx * dt * elapsed_time_ms);
+        particles[i].y += (vy * dt * elapsed_time_ms);
+        float spd2 = vx*vx + vy*vy;
         if(spd2<1000000000) current_energy += spd2;
-    }
-    
+    }  
     // Compute the amount of slowdown to prevent energy gain
     slowdown = 0.9*slowdown + 0.1*(initial_energy/current_energy);
     if(isnanf(slowdown))  slowdown = 0.1;
-
     // Check for collisions with bounding box
     for (int i = 0; i < NUM_PARTICLES; i++)  venturi_bounce(particles+i, slowdown);
-
     // Return the current amount of slowdown to maintain energy
     return slowdown;
 }
@@ -393,7 +424,7 @@ void generate_circle(SDL_Point *lut, int *pixcnt, int rad){
 static uint32_t wl_actual = 0;
 static SDL_Point wall_lut[(int)(RENDER_WIDTH*HEIGHT)];
 // Function to build a table of points to render for the walls
-void build_wall(float *section_areas){
+void build_wall(float *areas){
     // Zero section counts
     uint32_t section_null_cnts[SECTIONS];
     memset(section_null_cnts, 0, sizeof(section_null_cnts));
@@ -421,8 +452,8 @@ void build_wall(float *section_areas){
     }
     // Iterate through the sections to compute areas
     for(int i=0; i<SECTIONS; i++){
-        section_areas[i] = (float)section_null_cnts[i] / (RENDER_WIDTH*HEIGHT/SECTIONS);
-        printf("Section %d area:%.3f\n", i, section_areas[i]);
+        areas[i] = (float)section_null_cnts[i] / (RENDER_WIDTH*HEIGHT/SECTIONS);
+        printf("Section %d area:%.3f\n", i, areas[i]);
     }
     wl_actual = walli;
     // Clear the momentum sums
@@ -825,7 +856,7 @@ void render_particles_section(SDL_Renderer* renderer, particle* particles, float
 
 uint64_t getus(){
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    clock_gettime(CLOCK_MONOTONIC, &now);
     uint64_t tm = (uint64_t)now.tv_sec*1000000 + (uint64_t)now.tv_nsec/1000;
     return tm;
 }
@@ -849,14 +880,14 @@ void inline render_text(SDL_Renderer* renderer, SDL_Surface *surf, SDL_Texture *
 }
 
 // Copy rectangle of pixels into another renderer
-void chunk_window(SDL_Renderer* renderer, SDL_Renderer* output, SDL_Rect chunk, int out_y){
-    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, chunk.w, chunk.h, 32, SDL_PIXELFORMAT_RGBA32);
-    SDL_RenderReadPixels(renderer, &chunk, SDL_PIXELFORMAT_RGBA32, surf->pixels, surf->pitch);
-    SDL_Texture *tex = SDL_CreateTextureFromSurface(output, surf);
+void chunk_copy(SDL_Renderer* renderer, SDL_Rect in_chunk, SDL_Rect out_chunk){
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, in_chunk.w, in_chunk.h, 32, SDL_PIXELFORMAT_RGBA32);
+    SDL_RenderReadPixels(renderer, &in_chunk, SDL_PIXELFORMAT_RGBA32, surf->pixels, surf->pitch);
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
     SDL_FreeSurface(surf);
-    chunk.x=0;
-    chunk.y=out_y;
-    SDL_RenderCopy(output, tex, NULL, &chunk);
+    out_chunk.h = in_chunk.h;
+    out_chunk.w = in_chunk.w;
+    SDL_RenderCopy(renderer, tex, NULL, &out_chunk);
     SDL_DestroyTexture(tex);
 }
 
@@ -866,27 +897,17 @@ int main(int argc, char* argv[]) {
 
     setpriority(PRIO_PROCESS, 0, -20);
 
+    // Get setup defaults and stuff
+    char rc = get_file_info(&dt, &mdot_targ);
+
     int wall_view_w = fminf(THROAT_LEN, THROAT_WIDTH);
 
     //initialize SDL
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
-    SDL_Window* window = SDL_CreateWindow("Particle Simulation", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, RENDER_WIDTH, HEIGHT, 0);
+    SDL_Window* window = SDL_CreateWindow("Particle Simulation", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, RENDER_WIDTH, HEIGHT+THROAT_WIDTH+TXT_HEIGHT*2, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-
-    SDL_Window* win0 = SDL_CreateWindow("Input View", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, THROAT_WIDTH, THROAT_WIDTH, 0);
-    SDL_Renderer* renderer_in = SDL_CreateRenderer(win0, -1, SDL_RENDERER_ACCELERATED);
-
-    SDL_Window* win1 = SDL_CreateWindow("Throat View", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, THROAT_WIDTH, THROAT_WIDTH, 0);
-    SDL_Renderer* renderer_throat = SDL_CreateRenderer(win1, -1, SDL_RENDERER_ACCELERATED);
-
-    SDL_Window* win2 = SDL_CreateWindow("Wall Compare", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, wall_view_w, wall_view_w, 0);
-    SDL_Renderer* renderer_wall = SDL_CreateRenderer(win2, -1, SDL_RENDERER_ACCELERATED);
     
-
-    // Init particles
-    particle particles[NUM_PARTICLES];
-    init_particles(particles);
     // Pre-compute pixel locations for each rendered circle
     generate_circle(circle_lut, &circle_pixcnt, (int)RADIUS);
     printf("\n");
@@ -896,17 +917,22 @@ int main(int argc, char* argv[]) {
     int throat_sect = get_section(&p0);
 
     // Build side walls and compute relative section areas
-    float section_areas[SECTIONS];
     build_wall(section_areas);
     float bounce_areas[SECTIONS];
     get_bounce_areas(bounce_areas);
+
+    // Init particles
+    particle particles[NUM_PARTICLES];
+    init_particles(particles, section_areas);
+
+    SDL_GL_SetSwapInterval(-1);
 
     initial_energy=0.0;
 
     int pupdate=0;
     int kick=0;
 
-    int64_t now;
+    int64_t now, then;
     int64_t tm0 = getus();
     int64_t tm1 = getus();
     int64_t tm_render_particles=0, tm_render_walls=0, tm_present=0, tm_simulate=0, tm_full = 0;
@@ -914,7 +940,6 @@ int main(int argc, char* argv[]) {
 
     float looptm = 10.0;
 
-    char rc = get_render_color();
     int pcnt = 0;
 
     float speed[SECTIONS];
@@ -936,12 +961,13 @@ int main(int argc, char* argv[]) {
     float error_integral = 0;
     float last_error = 0;
     float mass_flow_rate = 0;
-    float mdot_targ = MDOT_TARG;
 
     TTF_Font *font = TTF_OpenFont("Vremyafwf-Rp1e.ttf", TXT_HEIGHT);
     TTF_Font *big_font = TTF_OpenFont("Vremyafwf-Rp1e.ttf", TXT_HEIGHT*3/2);
     if(!font)  printf("ERROR: %s\n\n", TTF_GetError());
     SDL_Color white = {255, 255, 255, 255};
+    SDL_Color magenta = {255, 0, 255, 255};
+    SDL_Color yellow = {255, 255, 0, 255};
     SDL_Surface *surf = TTF_RenderUTF8_Blended(font, "Hello", white);
     SDL_Texture *tex;
 
@@ -953,54 +979,54 @@ int main(int argc, char* argv[]) {
 
     //main loop for simulation
     while (1) {
+        now = getus();
+        tm_full += now - tm0;
+        tm0 = now;
+
+        
         SDL_Event event;
         if (SDL_PollEvent(&event) && event.type == SDL_QUIT) {
             break;
         }
-
         // Clear screen
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         // Render walls in gray
         render_walls(renderer, 60, 60, 60);
 
-        now = getus();
-        tm_full += now - tm0;
-        tm0 = now;
-
         // Render particles based on the readut from the start/stop file
         switch (rc){
             case 't':
                 render_particles_section(renderer, particles, temperature);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Temperature)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Temperature)");
                 break;
             case 'T':
                 render_particles_section(renderer, particles, temperature);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Temperature)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Temperature)");
                 break;
             case 'p':
-                render_particles_section(renderer, particles, pressure);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Pressure)");
+                render_particles_section(renderer, particles, mpx);
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Pressure)");
                 break;
             case 'P':
-                render_particles_section(renderer, particles, pressure);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Pressure)");
+                render_particles_section(renderer, particles, mpx);
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Pressure)");
                 break;
             case 'd':
                 render_particles_section(renderer, particles, density);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Density)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Density)");
                 break;
             case 'D':
                 render_particles_section(renderer, particles, density);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Density)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Density)");
                 break;
             case 's':
                 render_particles_xspd(renderer, particles);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Speed)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Speed)");
                 break;
             case 'S':
                 render_particles_xspd(renderer, particles);
-                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-2*TXT_HEIGHT, "(Color by Speed)");
+                render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Speed)");
                 break;
             case 'y':
                 render_particles_yspd(renderer, particles);
@@ -1013,27 +1039,47 @@ int main(int argc, char* argv[]) {
                 break;
         }
 
-        // Render the bounce subsections
-        SDL_Rect throat_wall = {.x=RENDER_WIDTH*DIVERGE_START, .y=(HEIGHT-THROAT_WIDTH)/2, .w=wall_view_w, .h=wall_view_w/2};
-        chunk_window(renderer, renderer_wall, throat_wall, 0);
-        throat_wall.x=RENDER_WIDTH-wall_view_w, throat_wall.y=0, throat_wall.w=wall_view_w, throat_wall.h=wall_view_w/2;
-        chunk_window(renderer, renderer_wall, throat_wall, wall_view_w/2);
+        now = getus();
+        double tsimd = (double)(now-tm1)/1000.0;
+        tm1 = now;
 
         // Render input chunk window
         SDL_SetRenderDrawColor(renderer, 255, 0, 255, 255);
-        float in_spd = (t_speed[SECTIONS-1] + t_speed[SECTIONS-2])/2.0 * dt;
-        in_x = (in_x < (RENDER_WIDTH - THROAT_WIDTH*1.5)) ? (RENDER_WIDTH - THROAT_WIDTH) : (in_x - in_spd);
+        float in_spd = (vx_means[SECTIONS-1] + vx_means[SECTIONS-2])/2.0 * dt * tsimd;
+        in_x = (in_x < (RENDER_WIDTH - THROAT_WIDTH*1.5)) ? (RENDER_WIDTH - THROAT_WIDTH) : (in_x + in_spd);
         SDL_Rect in_chunk = {.h=THROAT_WIDTH, .w=THROAT_WIDTH, .y=(HEIGHT-THROAT_WIDTH)/2, .x=roundf(in_x)};
         SDL_RenderDrawRect(renderer, &in_chunk);
-        chunk_window(renderer, renderer_in, in_chunk, 0);
-
+        SDL_Rect out_loc;
+        out_loc.y = HEIGHT + TXT_HEIGHT*2;  out_loc.x = RENDER_WIDTH-THROAT_WIDTH;
+        chunk_copy(renderer, in_chunk, out_loc);
+        render_text(renderer, surf, tex, font, white, out_loc.x+THROAT_WIDTH/2, HEIGHT+TXT_HEIGHT/2, "Input Bulk View");
+        
         // Render throat chunk window
         SDL_SetRenderDrawColor(renderer, 255, 255, 0, 255);
-        float throat_spd = (t_speed[throat_sect-1] + t_speed[throat_sect])/2.0 * dt;
-        throat_x = (throat_x < (RENDER_WIDTH*THROAT_POS - THROAT_WIDTH*3/4)) ? (RENDER_WIDTH*THROAT_POS - THROAT_WIDTH/4) : (throat_x - throat_spd);
+        float throat_spd = (vx_means[throat_sect-1] + vx_means[throat_sect])/2.0 * dt * tsimd;
+        throat_x = (throat_x < (RENDER_WIDTH*THROAT_POS - THROAT_WIDTH*3/4)) ? (RENDER_WIDTH*THROAT_POS - THROAT_WIDTH/4) : (throat_x + throat_spd);
         SDL_Rect throat_chunk = {.h=THROAT_WIDTH, .w=THROAT_WIDTH, .y=(HEIGHT-THROAT_WIDTH)/2, .x=roundf(throat_x)};
         SDL_RenderDrawRect(renderer, &throat_chunk);
-        chunk_window(renderer, renderer_throat, throat_chunk, 0);
+        out_loc.x -= THROAT_WIDTH*1.5;
+        chunk_copy(renderer, throat_chunk, out_loc);
+        render_text(renderer, surf, tex, font, white, out_loc.x+THROAT_WIDTH/2, HEIGHT+TXT_HEIGHT/2, "Throat Bulk View");
+
+        // Render the bounce subsections
+        SDL_Rect throat_wall = {.x=RENDER_WIDTH*DIVERGE_START, .y=(HEIGHT-THROAT_WIDTH)/2, .w=wall_view_w, .h=wall_view_w/2};
+        out_loc.w = throat_wall.w;  out_loc.h=throat_wall.h;
+        out_loc.x -= (THROAT_WIDTH*0.5 + wall_view_w);
+        chunk_copy(renderer, throat_wall, out_loc);
+        int txt_x = out_loc.x+(get_text_size(surf, font, "(T)").w)*0.7 + wall_view_w;
+        render_text(renderer, surf, tex, font, yellow, txt_x, out_loc.y+TXT_HEIGHT/4, "(T)");
+        SDL_SetRenderDrawColor(renderer, yellow.r, yellow.g, yellow.b, 255);
+        SDL_RenderDrawRect(renderer, &out_loc);
+        throat_wall.x=RENDER_WIDTH-wall_view_w, throat_wall.y=0, throat_wall.w=wall_view_w, throat_wall.h=wall_view_w/2;
+        out_loc.y += wall_view_w/2;
+        chunk_copy(renderer, throat_wall, out_loc);
+        render_text(renderer, surf, tex, font, white, out_loc.x+wall_view_w/2, HEIGHT+TXT_HEIGHT/2, "Bounce View");
+        render_text(renderer, surf, tex, font, magenta, txt_x, out_loc.y+TXT_HEIGHT/4, "(I)");
+        SDL_SetRenderDrawColor(renderer, magenta.r, magenta.g, magenta.b, 255);
+        SDL_RenderDrawRect(renderer, &out_loc);
 
         // Render status text on main display
         for(int s=0; s<SECTIONS; s+=1){
@@ -1058,9 +1104,6 @@ int main(int argc, char* argv[]) {
 
         // Update renderers
         SDL_RenderPresent(renderer);
-        SDL_RenderPresent(renderer_in);
-        SDL_RenderPresent(renderer_throat);
-        SDL_RenderPresent(renderer_wall);
         
         if(kick >= KICK_PERIOD){
             kick=0;
@@ -1074,7 +1117,7 @@ int main(int argc, char* argv[]) {
             // Compute average speed
             avg_speed = speed_sum/speed_cnt;
             // Compute mass flow rate
-            mass_flow_rate = 0.5*mass_flow_rate + 0.5*1000.0*((float)mass_flow_sum)/((float)mass_flow_cnt);
+            mass_flow_rate = 0.5*mass_flow_rate + (0.5/PFRAMES)*((float)mass_flow_sum);
             if(isnanf(mass_flow_rate))  mass_flow_rate = 0.0;
             speed_sum = 0;
             speed_cnt = 0;
@@ -1082,12 +1125,9 @@ int main(int argc, char* argv[]) {
             mass_flow_sum = 0;
 
             pcnt++;
-            rc = get_render_color();
+            rc = get_file_info( &dt, &mdot_targ);
             pupdate=0;
 
-            // vx_sums[SECTIONS] = {0};
-            // e_sums[SECTIONS] = {0};
-            // pcnts[SECTIONS] = {0};
             float pmin=0, smin=0, dmin=0, tmin=0, mpmin=0;
             pmax=0, smax=0, dmax=0, tmax=0, mmax=0, mpmax=0;
 
@@ -1100,8 +1140,8 @@ int main(int argc, char* argv[]) {
                 float spd = fabsf(vx_means[i]);
                 // Temperature proportional to KE per particle
                 float temp = e_sums[i]/pcnts[i];
-                // Mach number is ratio of spd to spd of sound
-                t_mach[i] = spd / sqrtf((5.0/9.0)*temp);
+                // Mach number is ratio of spd to spd of sound (2D case, gamma relation cancels out)
+                t_mach[i] = spd / sqrtf(temp);
                 // Smooth particle avg speed
                 t_speed[i] = (1.0-SMOOTHY)*t_speed[i] + SMOOTHY*spd;
                 // Smooth particle temperature
@@ -1159,8 +1199,9 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // PID controller for specific Mach target
-            float error = MDOT_TARG - mass_flow_rate;
+            // PID controller for specific mass flow target
+            float error = mdot_targ - mass_flow_rate;
+            blow_pwr = mdot_targ;
             // Derivative term
             float delta_s = (float)tm_full / 1000000.0;
             float d_error = (error-last_error) / delta_s;
@@ -1176,10 +1217,10 @@ int main(int argc, char* argv[]) {
                 error_integral = fmaxf(error_integral, -4.0);
             }
             // PID response
-            blow_pwr = error*3.5 + error_integral*0.4 + d_error*8.0;
-            if(blow_pwr<-1.0)  blow_pwr=-1.0;
-            long_bp = 0.99*long_bp + 0.01*blow_pwr;
-            blow_pwr = 0.6*long_bp + 0.4*blow_pwr;
+            //blow_pwr = error*3.5 + error_integral*0.4 + d_error*8.0;
+            if(blow_pwr<-0.1)  blow_pwr=-0.1;
+            //long_bp = 0.95*long_bp + 0.05*blow_pwr;
+            //blow_pwr = 0.5*long_bp + 0.5*blow_pwr;
 
 
             printf("SPEEDS: %d", (int)(speed[0]*1000));
@@ -1211,17 +1252,13 @@ int main(int argc, char* argv[]) {
             float rentm = ((float)tm_render_particles + (float)tm_render_walls) / 1000.0 / tcnt;
             float prestm = (float)tm_present / 1000.0 / tcnt;
             tcnt=0; tm_full=0; tm_render_particles=0; tm_render_walls=0; tm_simulate=0; tm_present=0;
-            printf("SLOWDOWN:%c %.3f, BPWR:%.2f Mdot:%.6f P:%.2f I:%.2f D:%.2f maxM:%.6f throat%.4f in%.4f\n", rc, slowdown, blow_pwr, mass_flow_rate, error, error_integral, d_error, mmax, throat_spd, in_spd);
+            printf("SLOWDOWN:%c %.3f, FPS:%.1f, BPWR:%.2f Mdot:%.6f P:%.2f I:%.2f D:%.2f maxM:%.6f throat%.4f in%.4f\n", rc, slowdown, 1000.0/looptm, blow_pwr, mass_flow_rate, error, error_integral, d_error, mmax, throat_spd, in_spd);
             fflush(stdout);
         }
         pupdate++;
 
-        // Advance the simulation by one timestep
-        simulate_timestep(particles);
-
-        now = getus();
-        tm_simulate += now-tm1;
-        tm1 = now;
+        // Simulate for elapsed time from last update call
+        simulate_timestep(particles, tsimd);
         tcnt++;
     }
 
