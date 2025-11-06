@@ -10,7 +10,7 @@
 const char control_fname[] = "/home/jtmcg/projects/psim/ctrl.txt";
 
 // Window geometry
-#define WIDTH 4500.0
+#define WIDTH 5500.0
 #define RENDER_WIDTH 3680.0
 #define HEIGHT 1100.0
 #define UNREND ((WIDTH-RENDER_WIDTH)/2)
@@ -23,14 +23,13 @@ const char control_fname[] = "/home/jtmcg/projects/psim/ctrl.txt";
 #define DIVERGE_END 0.08
 
 // Simulation parameters
-#define NUM_PARTICLES 3000 //number of particles in the simulation
-#define RADIUS 6 //radius of each particle
+#define NUM_PARTICLES 4500 //number of particles in the simulation
+#define EXIT_PX 0.85
+#define RADIUS 4.3 //radius of each particle
 #define INIT_DT 0.18 // initial timestep for simulation
 #define REPOS 1.0001 // Repositioning constant. Puts particles slightly further away on bounce to prevent them getting stuck
 
 // Blower power, expressed as a fraction of initial temperature
-#define MDOT_TARG 0.1 // Good for subsonic
-//#define MDOT_TARG 0.65 // Good for supersonic
 #define SMOOTHY 0.1
 
 // Surface roughness, scales the random shifts applied to wall bounce angle
@@ -56,7 +55,7 @@ typedef struct {
 inline float randf(){ return ((float)rand() / RAND_MAX); }
 
 // Function to read information from control file
-char get_file_info(float *sim_spd, float *mdot){
+char get_file_info(float *sim_spd, float *expx){
     FILE* fp = fopen(control_fname, "r");
     if( fp == NULL )  return 0;
     // Pull first line
@@ -76,7 +75,7 @@ char get_file_info(float *sim_spd, float *mdot){
     // Pull the second line and assign if valid
     if(fgets(rs, 40, fp)==NULL)  return charr;
     ret = atof(rs);
-    if(ret!=0.0) *mdot = ret;
+    if(ret!=0.0) *expx = ret;
 
     fclose(fp);
     return charr;
@@ -110,7 +109,7 @@ void inline lambert_reflect(particle *p, float surf_nx, float surf_ny, float ble
 
 // Householder reflection function for particle velocities
 static double momentum_sums[SECTIONS] = {0};
-inline void householder(particle *p, float nx, float ny, float bleed){
+inline void householder(particle *p, float nx, float ny){
     // Compute velocity dot product with normal
     float dot = (nx*p->vx + ny*p->vy);
     // Compute section summations for wall impact momentum
@@ -121,28 +120,28 @@ inline void householder(particle *p, float nx, float ny, float bleed){
     //     return;
     // }
     // Set bounce velocity
-    float s = (1.0+bleed)*dot;
+    float s = 2*dot;
     p->vx -= nx*s;
     p->vy -= ny*s;
 }
 
-inline uint8_t top_bot_bounce(particle *p, float energy_bleed, const float wall_offset){
+inline uint8_t top_bot_bounce(particle *p, const float wall_offset){
     float py = p->y;
     // Check Y rectangle bounds
     if(py <= (wall_offset + RADIUS)){
-        householder(p, 0, -1, energy_bleed);
+        householder(p, 0, -1);
         p->y = RADIUS*REPOS + wall_offset;
         return 1;
     }
     if(py >= (HEIGHT-RADIUS-wall_offset)){
-        householder(p, 0, 1, energy_bleed);
+        householder(p, 0, 1);
         p->y = HEIGHT - RADIUS*REPOS - wall_offset;
         return 1;
     }
     return 0;
 }
 
-inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_close, const float throat_width, const float length, const float throat_x){
+inline uint8_t constriction(particle *p, const uint8_t open_close, const float throat_width, const float length, const float throat_x){
     // Distance from wall to throat opening
     const float b = (HEIGHT-throat_width)/2;
     const float m = b / length;
@@ -157,7 +156,7 @@ inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_
         float yc = m*(p->x) + b_up;
         // Check upper boundary
         if(p->y < yc){
-            householder(p, -nx, ny, energy_bleed);
+            householder(p, -nx, ny);
             p->y = yc+(REPOS-1.0);
             return 1;
         }
@@ -165,7 +164,7 @@ inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_
         const float b_dwn = (-m)*(length-throat_x) + HEIGHT - RADIUS;
         yc = (-m)*(p->x) + b_dwn;
         if(p->y > yc){
-            householder(p, -nx, -ny, energy_bleed);
+            householder(p, -nx, -ny);
             p->y = yc-(REPOS-1.0);
             return 1;
         }
@@ -177,7 +176,7 @@ inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_
         float yc = (-m)*(p->x) + b_up;
         // Check upper boundary
         if(p->y < yc){
-            householder(p, nx, ny, energy_bleed);
+            householder(p, nx, ny);
             p->y = yc+(REPOS-1.0);
             return 1;
         }
@@ -185,7 +184,7 @@ inline uint8_t constriction(particle *p, float energy_bleed, const uint8_t open_
         const float b_dwn = (-m)*throat_x + b + throat_width - RADIUS;
         yc = m*(p->x) + b_dwn;
         if(p->y > yc){
-            householder(p, nx, -ny, energy_bleed);
+            householder(p, nx, -ny);
             p->y = yc-(REPOS-1.0);
             return 1;
         }
@@ -204,24 +203,15 @@ static int mass_flow_sum = 0;
 static uint32_t mass_flow_cnt = 0;
 
 static float blow_pwr = 0;
-uint8_t venturi_bounce(particle *p, float energy_bleed){
-    // Implement left boundary wrap
-    if(p->x <= 0){
-        p->x = (WIDTH-REPOS+1);
-        p->vx *= energy_bleed;
-        p->vy *= energy_bleed;
-        // Add fan speed to particle
-        p->vx -= blow_pwr;
-        // Increment the mass flow rate counter
-        mass_flow_sum ++;
-    // Implement right boundary wrap
-    }else if(p->x >= WIDTH){
-        p->x = (REPOS-1);
-        // Decrement the mass flow rate counter
-        mass_flow_sum --;
+uint8_t venturi_bounce(particle *p){
+    float x = p->x;
+    if(( x < 0 ) || ( x > WIDTH )){
+        p->x = -1.0;
+        p->y = -1.0;
+        p->vx = 0;
+        p->vy = 0;
+        return 1;
     }
-    mass_flow_cnt ++;
-    
     int s = get_section(p);
     float vx = p->vx, vy = p->vy;
     speed_sum += vx;
@@ -236,23 +226,22 @@ uint8_t venturi_bounce(particle *p, float energy_bleed){
         pcnts[s] ++;
     }
     // Compute the X offset
-    float x = p->x - UNREND;
-    energy_bleed = 1.0;
+    x = p->x - UNREND;
     // Wide wall bounce
     if( x < RENDER_WIDTH*DIVERGE_END ){
-        return top_bot_bounce(p, energy_bleed, 0.0);
+        return top_bot_bounce(p, 0.0);
     // Divergent section
     }else if( x < RENDER_WIDTH*DIVERGE_START ){
-        return constriction(p, energy_bleed, 1, THROAT_WIDTH, RENDER_WIDTH*(DIVERGE_START-DIVERGE_END), RENDER_WIDTH*DIVERGE_START+UNREND);
+        return constriction(p, 1, THROAT_WIDTH, RENDER_WIDTH*(DIVERGE_START-DIVERGE_END), RENDER_WIDTH*DIVERGE_START+UNREND);
     // Throat
     }else if( x < RENDER_WIDTH*THROAT_POS ){
-        return top_bot_bounce(p, energy_bleed, (HEIGHT-THROAT_WIDTH)*0.5);
+        return top_bot_bounce(p, (HEIGHT-THROAT_WIDTH)*0.5);
     // Convergent section
     }else if( x < RENDER_WIDTH*CONVERGE_START ){
-        return constriction(p, energy_bleed, 0, THROAT_WIDTH, RENDER_WIDTH*(CONVERGE_START-THROAT_POS), RENDER_WIDTH*THROAT_POS+UNREND);
+        return constriction(p, 0, THROAT_WIDTH, RENDER_WIDTH*(CONVERGE_START-THROAT_POS), RENDER_WIDTH*THROAT_POS+UNREND);
     // Other wide wall
     }else{
-        return top_bot_bounce(p, energy_bleed, 0.0);
+        return top_bot_bounce(p, 0.0);
     }
 }
 
@@ -261,7 +250,7 @@ inline uint8_t check_overlap(particle* particles, float x, float y, int occ){
     particle p;
     p.x=x; p.y=y; p.vx=0; p.vy=0;
     // Check if particle outside of bounds
-    if(venturi_bounce(&p, 1.0)){ return 1; }
+    if(venturi_bounce(&p)){ return 1; }
     // Check if particle overlaps another
     for(int i=0; i<occ; i++){
         float dx = particles[i].x - x;
@@ -272,18 +261,9 @@ inline uint8_t check_overlap(particle* particles, float x, float y, int occ){
     return 0;
 }
 
-static float mdot_targ = MDOT_TARG;
 static float dt = INIT_DT;
 // Function to initialize particles with random positions and velocities
 void init_particles(particle* particles, float *areas) {
-    // Get total area in square pixels
-    double ar_tot = HEIGHT*(WIDTH-RENDER_WIDTH);
-    for(int i=0; i<SECTIONS; i++)  ar_tot += areas[i]*(RENDER_WIDTH*HEIGHT/SECTIONS);
-    // Get particle density
-    float density = (float)NUM_PARTICLES / ar_tot;
-    // Predict speed required to hit given mass flow rate
-    float init_spd = MDOT_TARG / (HEIGHT * density);
-    printf("INIT PARTICLE SPD: %.3f\n\n", init_spd);
     int i=0;
     // Continue to generate new particles at random locations until desired quantity is reached
     while(i<NUM_PARTICLES){
@@ -293,22 +273,42 @@ void init_particles(particle* particles, float *areas) {
             particles[i].x = cx;
             particles[i].y = cy;
             particles[i].vy = (randf()*2 - 1);
-            particles[i].vx = (randf() - 0.5) - 3*init_spd;
+            particles[i].vx = (randf()*2 - 1);
             i++;
         }
     }
+    while(i<NUM_PARTICLES){
+        particles[i].x = -1.0;
+        particles[i].y = -1.0;
+        particles[i].vy = 0;
+        particles[i].vx = 0;
+        i++;
+    }
+}
+
+inline int null_particle(particle *p){
+    float x = p->x;
+    if(isnan(x) || x<0){
+        p->x = -1.0;
+        p->y = -1.0;
+        p->vx = 0;
+        p->vy = 0;
+        return 1;
+    }
+    return 0;
 }
 
 // Declare and zero the initial energy
 static float last_dist[NUM_PARTICLES*NUM_PARTICLES/2];
-
 inline void interparticle_bounce(particle *particles){
     // Scan through all particle pair combos
     for (int i = 0; i < (NUM_PARTICLES - 1); i++) {
         float ix = particles[i].x;
+        if(ix<0)  continue;
         float iy = particles[i].y;
         for (int j = i + 1; j < NUM_PARTICLES; j++) {
             float jx = particles[j].x;
+            if(jx<0)  continue;
             float jy = particles[j].y;
             // Compute distance with distance formula
             float dx = ix - jx;
@@ -346,43 +346,110 @@ inline void interparticle_bounce(particle *particles){
     }
 }
 
-double inline get_energy(particle *particles){
-    double en = 0;
+// Function to return the initial relative pressure
+void inline get_num_temp(particle *particles, int *cnt, double *temp){
+    double t = 0;
+    int c = 0;
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        float spd2 = particles[i].vx*particles[i].vx + particles[i].vy*particles[i].vy;
-        en += spd2;
+        float x = particles[i].x;
+        if((x >= 0) && ((x<UNREND) || (x>(UNREND+RENDER_WIDTH)))){
+            float spd2 = particles[i].vx*particles[i].vx + particles[i].vy*particles[i].vy;
+            t += spd2;
+            c++;
+        }
     }
-    return en;
+    // Return the average temp/cnt for each half
+    *temp = t / c;
+    *cnt = c / 2;
 }
 
-static float slowdown = 0;
-static double initial_energy=0.0;
-// Function to simulate a timestep for each particle
-float simulate_timestep(particle* particles, double elapsed_time_ms) {
-    // Compute the initial energy if it is the first go around
-    if(initial_energy==0.0){
-        initial_energy = get_energy(particles);
-        slowdown = 1.0;
+inline int inject_particles(particle *particles, float injection_energy, int cnt, const uint8_t entry_true){
+    // Return null if all requested particles injected
+    if(cnt<=0)  return 0;
+    // Scan for empty particles
+    for(int i=0; i<NUM_PARTICLES; i++){
+        float x = particles[i].x;
+        float y = particles[i].y;
+        if(x<0 && y<0){
+            // Inject particle to entry or exit
+            particles[i].x = entry_true ? (WIDTH-RADIUS) : RADIUS;
+            // Randomize Y position
+            particles[i].y = RADIUS + (HEIGHT-2*RADIUS)*randf();
+            // Provide random initial Y velocity
+            particles[i].vy = injection_energy*(randf()*2.0 - 1.0);
+            // Provide initial X velocity directed to the middle
+            particles[i].vx = injection_energy*randf()*(entry_true ? -1.0 : 1.0);
+            // Tally particle injected
+            cnt --;
+        }
+        // Return null if all requested particles injected
+        if(cnt<=0)  return 0;
     }
+    // Otherwise return for not enough particles available
+    return -1;
+}
+
+static double init_temp=0.0;
+static int init_cnt = 0;
+static int out_cnt_targ = 0;
+static float entry_inject_temp = 1.0;
+static float exit_inject_temp = 1.0;
+static int entry_cnt = 0;
+static int exit_cnt = 0;
+static float exit_px = EXIT_PX;
+// Function to simulate a timestep for each particle
+float simulate_timestep(particle* particles, double elapsed_time_ms){
+    // Get the initial temperature and density for inlet/outlet regions
+    if(init_cnt==0){
+        get_num_temp(particles, &init_cnt, &init_temp);
+    }
+    out_cnt_targ = init_cnt*exit_px;
     // Check all particle pairs for collision events
     interparticle_bounce(particles);
-    double current_energy = 0;    
+    entry_cnt = 0;
+    exit_cnt = 0;
+    double entry_energy = 0.0;
+    double exit_energy = 0.0; 
     // Update positions of particles
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        float vx = particles[i].vx;
-        float vy = particles[i].vy;
-        particles[i].x += (vx * dt * elapsed_time_ms);
-        particles[i].y += (vy * dt * elapsed_time_ms);
-        float spd2 = vx*vx + vy*vy;
-        if(spd2<1000000000) current_energy += spd2;
-    }  
-    // Compute the amount of slowdown to prevent energy gain
-    slowdown = 0.9*slowdown + 0.1*(initial_energy/current_energy);
-    if(isnanf(slowdown))  slowdown = 0.1;
-    // Check for collisions with bounding box
-    for (int i = 0; i < NUM_PARTICLES; i++)  venturi_bounce(particles+i, slowdown);
-    // Return the current amount of slowdown to maintain energy
-    return slowdown;
+        // Execute wall bounces and LR edge particle removal
+        venturi_bounce(particles+i);
+        // Filter for present particles
+        float x = particles[i].x;
+        if(isnan(x)){
+            particles[i].x = -1.0;
+            particles[i].y = -1.0;
+            particles[i].vx = 0;
+            particles[i].vy = 0;
+        }else if(x >= 0 ){
+            // Propagate particle position from speed
+            float vx = particles[i].vx;
+            float vy = particles[i].vy;
+            particles[i].x += (vx * dt * elapsed_time_ms);
+            particles[i].y += (vy * dt * elapsed_time_ms);
+            // Compute various energies
+            if(x<UNREND){
+                float spd2 = vx*vx + vy*vy;
+                exit_energy += spd2;
+                exit_cnt++;
+            }else if(x>(RENDER_WIDTH+UNREND)){
+                float spd2 = vx*vx + vy*vy;
+                entry_energy += spd2;
+                entry_cnt++;
+            }
+        }
+    }
+
+    // Adjust injection temperatures to maintain initial state
+    if(entry_energy > 0)  entry_inject_temp *= (init_temp*entry_cnt/entry_energy);
+    if(exit_energy > 0)  exit_inject_temp *= (init_temp*exit_cnt/exit_energy);
+    if(entry_inject_temp > 5)  entry_inject_temp = 5;
+    if(exit_inject_temp > 5)  exit_inject_temp = 5;
+
+    // Inject particles to exit
+    inject_particles(particles, exit_inject_temp, (out_cnt_targ - exit_cnt), 0);
+    // Inject particles to entry
+    inject_particles(particles, entry_inject_temp, (init_cnt - entry_cnt), 1);
 }
 
 // Define a table to hold pixel offsets for rendering a filled in circle
@@ -439,7 +506,7 @@ void build_wall(float *areas){
         for(int y=0; y<HEIGHT; y++){
             p.y=y;
             // Draw point if particle outside of bounds
-            if(venturi_bounce(&p, 1.0)){
+            if(venturi_bounce(&p)){
                 wall_lut[walli].x = x;
                 wall_lut[walli].y = y;
                 walli++;
@@ -463,7 +530,7 @@ void build_wall(float *areas){
 // Return Y intercept of particular x location in renderspace
 inline int y_intercept(int x){
     particle p = {.vx=0, .vy=0, .x=x, .y=0};
-    while(venturi_bounce(&p, 1.0))  p.y ++;
+    while(venturi_bounce(&p))  p.y ++;
     return p.y;
 }
 
@@ -898,7 +965,7 @@ int main(int argc, char* argv[]) {
     setpriority(PRIO_PROCESS, 0, -20);
 
     // Get setup defaults and stuff
-    char rc = get_file_info(&dt, &mdot_targ);
+    char rc = get_file_info(&dt, &exit_px);
 
     int wall_view_w = fminf(THROAT_LEN, THROAT_WIDTH);
 
@@ -927,7 +994,6 @@ int main(int argc, char* argv[]) {
 
     SDL_GL_SetSwapInterval(-1);
 
-    initial_energy=0.0;
 
     int pupdate=0;
     int kick=0;
@@ -985,9 +1051,7 @@ int main(int argc, char* argv[]) {
 
         
         SDL_Event event;
-        if (SDL_PollEvent(&event) && event.type == SDL_QUIT) {
-            break;
-        }
+        if (SDL_PollEvent(&event) && event.type == SDL_QUIT)  break;
         // Clear screen
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
@@ -1005,11 +1069,11 @@ int main(int argc, char* argv[]) {
                 render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Temperature)");
                 break;
             case 'p':
-                render_particles_section(renderer, particles, mpx);
+                render_particles_section(renderer, particles, pressure);
                 render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Pressure)");
                 break;
             case 'P':
-                render_particles_section(renderer, particles, mpx);
+                render_particles_section(renderer, particles, pressure);
                 render_text(renderer, surf, tex, big_font, white, RENDER_WIDTH*(THROAT_POS+DIVERGE_START)/2, HEIGHT-3*TXT_HEIGHT, "(Color by Pressure)");
                 break;
             case 'd':
@@ -1089,7 +1153,7 @@ int main(int argc, char* argv[]) {
             SDL_Rect mt = get_text_size(surf, font, mstr);
             sprintf(tstr, "T%.2f", t_temperature[s]/tmax);
             SDL_Rect tt = get_text_size(surf, font, tstr);
-            sprintf(pstr, "P%.2f", t_mpx[s]/mpmax);
+            sprintf(pstr, "P%.2f", t_pressure[s]/pmax);
             SDL_Rect pt = get_text_size(surf, font, pstr);
             int maxw = (mt.w > pt.w) ? mt.w : pt.w;
             maxw = (tt.w > maxw) ? tt.w : maxw;
@@ -1112,20 +1176,19 @@ int main(int argc, char* argv[]) {
         }
         kick++;
         
-        
         if(pupdate>=PFRAMES){
             // Compute average speed
             avg_speed = speed_sum/speed_cnt;
             // Compute mass flow rate
             mass_flow_rate = 0.5*mass_flow_rate + (0.5/PFRAMES)*((float)mass_flow_sum);
-            if(isnanf(mass_flow_rate))  mass_flow_rate = 0.0;
+            if(isnan(mass_flow_rate))  mass_flow_rate = 0.0;
             speed_sum = 0;
             speed_cnt = 0;
             mass_flow_cnt = 0;
             mass_flow_sum = 0;
 
             pcnt++;
-            rc = get_file_info( &dt, &mdot_targ);
+            rc = get_file_info( &dt, &exit_px);
             pupdate=0;
 
             float pmin=0, smin=0, dmin=0, tmin=0, mpmin=0;
@@ -1180,7 +1243,6 @@ int main(int argc, char* argv[]) {
                 mpmax = fmaxf(t_mpx[i], mpmax);
             }
 
-
             // Rescale sections to relative values
             int s_mm = 0;
             for(int i=0; i<SECTIONS; i++){
@@ -1198,30 +1260,6 @@ int main(int argc, char* argv[]) {
                     s_mm = i;
                 }
             }
-
-            // PID controller for specific mass flow target
-            float error = mdot_targ - mass_flow_rate;
-            blow_pwr = mdot_targ;
-            // Derivative term
-            float delta_s = (float)tm_full / 1000000.0;
-            float d_error = (error-last_error) / delta_s;
-            last_error = error;
-            // Integral term with windup catch
-            if(error_integral > 0){
-                float add = (error<0) ? 3.5*error : error;
-                error_integral += add;
-                error_integral = fminf(error_integral, 4.0);
-            }else{
-                float add = (error>0) ? 3.5*error : error;
-                error_integral += add;
-                error_integral = fmaxf(error_integral, -4.0);
-            }
-            // PID response
-            //blow_pwr = error*3.5 + error_integral*0.4 + d_error*8.0;
-            if(blow_pwr<-0.1)  blow_pwr=-0.1;
-            //long_bp = 0.95*long_bp + 0.05*blow_pwr;
-            //blow_pwr = 0.5*long_bp + 0.5*blow_pwr;
-
 
             printf("SPEEDS: %d", (int)(speed[0]*1000));
             for(int i=1; i<SECTIONS; i++)  printf(" %d", (int)(speed[i]*1000));
@@ -1252,7 +1290,17 @@ int main(int argc, char* argv[]) {
             float rentm = ((float)tm_render_particles + (float)tm_render_walls) / 1000.0 / tcnt;
             float prestm = (float)tm_present / 1000.0 / tcnt;
             tcnt=0; tm_full=0; tm_render_particles=0; tm_render_walls=0; tm_simulate=0; tm_present=0;
-            printf("SLOWDOWN:%c %.3f, FPS:%.1f, BPWR:%.2f Mdot:%.6f P:%.2f I:%.2f D:%.2f maxM:%.6f throat%.4f in%.4f\n", rc, slowdown, 1000.0/looptm, blow_pwr, mass_flow_rate, error, error_integral, d_error, mmax, throat_spd, in_spd);
+            int null_cnt = 0;
+            int nan_cnt = 0;
+            double xum = 0;
+            for(int i=0; i<NUM_PARTICLES; i++){
+                float x = particles[i].x;
+                null_cnt += (x < 0);
+                xum += x;
+                nan_cnt += isnan(x);
+            }
+            xum = xum / NUM_PARTICLES;
+            printf("SLOWDOWN:%c entry%d/%d/%.2f exit%d/%d/%.2f, null%d, FPS:%.1f, maxM:%.6f throat%.4f in%.4f\n", rc, entry_cnt, init_cnt, entry_inject_temp, exit_cnt, out_cnt_targ, exit_inject_temp, null_cnt, 1000.0/looptm, mmax, throat_spd, in_spd);
             fflush(stdout);
         }
         pupdate++;
