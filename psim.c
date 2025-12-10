@@ -10,22 +10,23 @@
 const char control_fname[] = "/home/jtmcg/projects/psim/ctrl.txt";
 
 // Window geometry
-#define WIDTH 5500.0
+#define WIDTH 4500.0
 #define RENDER_WIDTH 3680.0
 #define HEIGHT 1100.0
 #define UNREND ((WIDTH-RENDER_WIDTH)/2)
 #define TXT_HEIGHT 45
 // Channel geometry
 #define THROAT_WIDTH (HEIGHT*0.45)
+//#define THROAT_WIDTH  HEIGHT
 #define CONVERGE_START 0.9
 #define THROAT_POS 0.6
 #define DIVERGE_START 0.55
 #define DIVERGE_END 0.08
 
 // Simulation parameters
-#define NUM_PARTICLES 4500 //number of particles in the simulation
+#define NUM_PARTICLES 2800 //number of particles in the simulation
 #define EXIT_PX 0.85
-#define RADIUS 4.3 //radius of each particle
+#define RADIUS 6.5 //radius of each particle
 #define INIT_DT 0.18 // initial timestep for simulation
 #define REPOS 1.0001 // Repositioning constant. Puts particles slightly further away on bounce to prevent them getting stuck
 
@@ -75,9 +76,10 @@ char get_file_info(float *sim_spd, float *expx){
     // Pull the second line and assign if valid
     if(fgets(rs, 40, fp)==NULL)  return charr;
     ret = atof(rs);
-    if(ret!=0.0) *expx = ret;
+    *expx = ret;
 
     fclose(fp);
+    printf("C:%c SPD:%.2f exPX:%.2f\n", charr, *sim_spd, *expx);
     return charr;
 }
 
@@ -820,17 +822,22 @@ const uint8_t color_lut[256][3] = {
 
 
 // Function to render particles with coloration based on speed
-static float max_vx = 1;
+static float max_vx = 0.05;
 void render_particles_xspd(SDL_Renderer* renderer, particle* particles) {
-    float max = 0;
+    max_vx *= 0.99;
     for (int i = 0; i < NUM_PARTICLES; i++) {
         int px = (int)particles[i].x - UNREND;
         int py = (int)particles[i].y;
-        if(px>RADIUS && px<=(RENDER_WIDTH-RADIUS)){
-            float cif = cbrtf(particles[i].vx/max_vx);
-            int ci = (int)(127.0*cif + 128.0);
-            if(ci>255){ ci=255; }
-            else if(ci<0){ ci=0; }
+        int s = get_section(particles+i);
+        float spd = 0;
+        if(px>RADIUS && px<=(RENDER_WIDTH-RADIUS) && s>=0){
+            // Compute particle speed color index and clamp index
+            float vx = particles[i].vx - vx_means[s];
+            float vy = particles[i].vy;
+            spd = sqrtf(vx*vx + vy*vy);
+            int ci = (int)(255.0*(1.0 - spd/max_vx));
+            if(ci<0)  ci=0;
+            else if(ci>255)  ci=255;
             // Colorize based on particle speed
             SDL_SetRenderDrawColor(renderer, color_lut[ci][0], color_lut[ci][1], color_lut[ci][2], 255);
             SDL_Point pts[circle_pixcnt];
@@ -839,11 +846,10 @@ void render_particles_xspd(SDL_Renderer* renderer, particle* particles) {
                 pts[c].y = py + circle_lut[c].y;
             }
             SDL_RenderDrawPoints(renderer, pts, circle_pixcnt);
+            // Find max/min speed
+            max_vx = fmaxf(max_vx, spd);
         }
-        // Find max vx
-        if(fabsf(particles[i].vx) > max)  max = particles[i].vx;
     }
-    max_vx = max;
 }
 
 // Y speed particle rendering
@@ -992,7 +998,7 @@ int main(int argc, char* argv[]) {
     particle particles[NUM_PARTICLES];
     init_particles(particles, section_areas);
 
-    SDL_GL_SetSwapInterval(-1);
+    SDL_GL_SetSwapInterval(1);
 
 
     int pupdate=0;
