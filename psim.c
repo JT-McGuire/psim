@@ -1209,8 +1209,8 @@ int main(int argc, char* argv[]) {
                 float spd = fabsf(vx_means[i]);
                 // Temperature proportional to KE per particle
                 float temp = e_sums[i]/pcnts[i];
-                // Mach number is ratio of spd to spd of sound (2D case, gamma relation cancels out)
-                t_mach[i] = spd / sqrtf(temp);
+                // Mach number is ratio of spd to spd of sound (2D case, c = sqrt(2/3) * Vrms)
+                t_mach[i] = 1.225 * spd / sqrtf(temp);
                 // Smooth particle avg speed
                 t_speed[i] = (1.0-SMOOTHY)*t_speed[i] + SMOOTHY*spd;
                 // Smooth particle temperature
