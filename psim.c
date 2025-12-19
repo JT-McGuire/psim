@@ -12,21 +12,22 @@ const char control_fname[] = "/home/jtmcg/projects/psim/ctrl.txt";
 // Window geometry
 #define WIDTH 4500.0
 #define RENDER_WIDTH 3680.0
-#define HEIGHT 1100.0
+#define HEIGHT 900.0
 #define UNREND ((WIDTH-RENDER_WIDTH)/2)
 #define TXT_HEIGHT 45
 // Channel geometry
 #define THROAT_WIDTH (HEIGHT*0.45)
 //#define THROAT_WIDTH  HEIGHT
 #define CONVERGE_START 0.9
-#define THROAT_POS 0.6
-#define DIVERGE_START 0.55
-#define DIVERGE_END 0.08
+#define THROAT_POS 0.25
+#define DIVERGE_START 0.02
+#define DIVERGE_END 0.01
 
 // Simulation parameters
-#define NUM_PARTICLES 2800 //number of particles in the simulation
+#define VSYNC_PARAM -1     // Change VSYNC param.  1 = unrestricted,  -1 = vsync,  0 = ???
+#define NUM_PARTICLES 2800 // number of particles in the simulation
 #define EXIT_PX 0.85
-#define RADIUS 6.5 //radius of each particle
+#define RADIUS 6.7   // radius of each particle
 #define INIT_DT 0.18 // initial timestep for simulation
 #define REPOS 1.0001 // Repositioning constant. Puts particles slightly further away on bounce to prevent them getting stuck
 
@@ -998,7 +999,7 @@ int main(int argc, char* argv[]) {
     particle particles[NUM_PARTICLES];
     init_particles(particles, section_areas);
 
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(VSYNC_PARAM);
 
 
     int pupdate=0;
